@@ -12,7 +12,6 @@
 -include_lib("kernel/include/logger.hrl").
 -include_lib("rabbitmq_stomp/include/rabbit_stomp.hrl").
 -include_lib("rabbitmq_stomp/include/rabbit_stomp_frame.hrl").
--include_lib("amqp_client/include/amqp_client.hrl").
 -include_lib("rabbit_common/include/logging.hrl").
 
 %% Websocket.
@@ -31,6 +30,7 @@
          takeover/7]).
 
 -record(state, {
+    conn_name,
     frame_type,
     heartbeat_mode,
     heartbeat,
@@ -128,13 +128,20 @@ init(Req0, Opts) ->
         auth_hd            = cowboy_req:header(<<"authorization">>, Req)
     }, WsOpts#{data_delivery => relay}}.
 
-websocket_init(State) ->
-    process_flag(trap_exit, true),
-    {ok, ProcessorState} = init_processor_state(State),
-    {ok, rabbit_event:init_stats_timer(
-           State#state{proc_state     = ProcessorState,
-                       parse_state    = rabbit_stomp_frame:initial_state()},
-           #state.stats_timer)}.
+websocket_init(State = #state{socket = Sock}) ->
+    case rabbit_net:connection_string(Sock, inbound) of
+        {ok, ConnStr} ->
+            ?LOG_INFO("Accepting Web STOMP connection ~s", [ConnStr]),
+            process_flag(trap_exit, true),
+            {ok, ProcessorState} = init_processor_state(State),
+            {ok, rabbit_event:init_stats_timer(
+                   State#state{proc_state     = ProcessorState,
+                               parse_state    = rabbit_stomp_frame:initial_state(),
+                               conn_name = rabbit_data_coercion:to_binary(ConnStr)},
+                   #state.stats_timer)};
+        {error, Reason} ->
+            {[{shutdown_reason, Reason}], State}
+    end.
 
 -spec close_connection(pid(), string()) -> 'ok'.
 close_connection(Pid, Reason) ->
@@ -146,7 +153,7 @@ close_connection(Pid, Reason) ->
         exit:{noproc, _} -> ok
     end.
 
-init_processor_state(#state{socket=Sock, peername=PeerAddr, auth_hd=AuthHd}) ->
+init_processor_state(#state{socket=Sock, conn_name=ConnName, auth_hd=AuthHd}) ->
     Self = self(),
     SendFun = fun(Data) ->
                       Self ! {send, Data},
@@ -162,7 +169,6 @@ init_processor_state(#state{socket=Sock, peername=PeerAddr, auth_hd=AuthHd}) ->
         true ->
             case AuthHd of
                 undefined ->
-                    %% We fall back to the default STOMP credentials.
                     StompConfig1#stomp_configuration{force_default_creds = true};
                 _ ->
                     {basic, HTTPLogin, HTTPPassCode}
@@ -176,12 +182,21 @@ init_processor_state(#state{socket=Sock, peername=PeerAddr, auth_hd=AuthHd}) ->
             StompConfig1
     end,
 
-    AdapterInfo = amqp_connection:socket_adapter_info(Sock, {'Web STOMP', 0}),
     RealSocket = rabbit_net:unwrap_socket(Sock),
     LoginNameFromCertificate = rabbit_stomp_reader:ssl_login_name(RealSocket, StompConfig2),
+    {PeerHost, PeerPort, Host, Port} =
+        case rabbit_net:socket_ends(Sock, inbound) of
+            {ok, Ends} -> Ends;
+            {error, _} -> {undefined, 0, undefined, 0}
+        end,
+    ConnNameBin = case ConnName of
+                      undefined -> <<"unknown">>;
+                      _ -> rabbit_data_coercion:to_binary(ConnName)
+                  end,
     ProcessorState = rabbit_stomp_processor:initial_state(
         StompConfig2,
-        {SendFun, AdapterInfo, LoginNameFromCertificate, PeerAddr}),
+        {SendFun, LoginNameFromCertificate, ConnNameBin,
+         Host, Port, PeerHost, PeerPort}),
     {ok, ProcessorState}.
 
 websocket_handle({text, Data}, State) ->
@@ -201,48 +216,9 @@ websocket_info({bump_credit, Msg}, State) ->
     credit_flow:handle_bump_msg(Msg),
     handle_credits(control_throttle(State));
 
-websocket_info(#'basic.consume_ok'{}, State) ->
-    {ok, State};
-websocket_info(#'basic.cancel_ok'{}, State) ->
-    {ok, State};
-websocket_info(#'basic.ack'{delivery_tag = Tag, multiple = IsMulti},
-               State=#state{ proc_state = ProcState0 }) ->
-    ProcState = rabbit_stomp_processor:flush_pending_receipts(Tag,
-                                                              IsMulti,
-                                                              ProcState0),
-    {ok, State#state{ proc_state = ProcState }};
-websocket_info({Delivery = #'basic.deliver'{},
-               #amqp_msg{props = Props, payload = Payload},
-               DeliveryCtx},
-               State=#state{ proc_state = ProcState0 }) ->
-    ProcState = rabbit_stomp_processor:send_delivery(Delivery,
-                                                     Props,
-                                                     Payload,
-                                                     DeliveryCtx,
-                                                     ProcState0),
-    {ok, State#state{ proc_state = ProcState }};
-websocket_info({Delivery = #'basic.deliver'{},
-               #amqp_msg{props = Props, payload = Payload}},
-               State=#state{ proc_state = ProcState0 }) ->
-    ProcState = rabbit_stomp_processor:send_delivery(Delivery,
-                                                     Props,
-                                                     Payload,
-                                                     undefined,
-                                                     ProcState0),
-    {ok, State#state{ proc_state = ProcState }};
-websocket_info(#'basic.cancel'{consumer_tag = Ctag},
-               State=#state{ proc_state = ProcState0 }) ->
-    case rabbit_stomp_processor:cancel_consumer(Ctag, ProcState0) of
-      {ok, ProcState, _Connection} ->
-        {ok, State#state{ proc_state = ProcState }};
-      {stop, _Reason, ProcState} ->
-        stop(State#state{ proc_state = ProcState })
-    end;
-
 websocket_info({start_heartbeats, _},
                State = #state{heartbeat_mode = no_heartbeat}) ->
     {ok, State};
-
 websocket_info({start_heartbeats, {0, 0}}, State) ->
     {ok, State};
 websocket_info({start_heartbeats, {SendTimeout, ReceiveTimeout}},
@@ -270,20 +246,23 @@ websocket_info({start_heartbeats, {SendTimeout, ReceiveTimeout}},
                                    SendFun, ReceiveTimeout, ReceiveFun)
     end,
     {ok, State#state{heartbeat = Heartbeat}};
+websocket_info(connection_created, State) ->
+    Infos = infos(?INFO_ITEMS ++ ?OTHER_METRICS, State),
+    ?LOG_DEBUG("Connection created infos ~p", [Infos]),
+    rabbit_core_metrics:connection_created(self(), Infos),
+    rabbit_event:notify(connection_created, Infos),
+    {[], State, hibernate};
 websocket_info(client_timeout, State) ->
     stop(State);
+websocket_info({'$gen_cast', QueueEvent = {queue_event, _, _}}, State) ->
+    ProcState = processor_state(State),
+    case rabbit_stomp_processor:handle_queue_event(QueueEvent, ProcState) of
+        {ok, NewProcState} ->
+            {[{active, true}], processor_state(NewProcState, State), hibernate};
+        {error, _Reason, NewProcState} ->
+            stop(State#state{proc_state = NewProcState})
+    end;
 
-%%----------------------------------------------------------------------------
-websocket_info({'EXIT', From, Reason},
-               State=#state{ proc_state = ProcState0 }) ->
-  case rabbit_stomp_processor:handle_exit(From, Reason, ProcState0) of
-    {stop, _Reason, ProcState} ->
-        stop(State#state{ proc_state = ProcState });
-    unknown_exit ->
-        %% Allow the server to send remaining error messages
-        self() ! close_websocket,
-        {ok, State}
-  end;
 websocket_info(close_websocket, State) ->
     stop(State);
 
@@ -300,6 +279,10 @@ websocket_info(Msg, State) ->
 terminate(_Reason, _Req, State = #state{proc_state = undefined}) ->
     terminate_heartbeaters(State);
 terminate(_Reason, _Req, State = #state{proc_state = ProcState}) ->
+    rabbit_core_metrics:connection_closed(self()),
+    Infos = infos(?OTHER_METRICS, State),
+    rabbit_event:notify(connection_closed, Infos),
+    rabbit_networking:unregister_non_amqp_connection(self()),
     _ = rabbit_stomp_processor:flush_and_die(ProcState),
     terminate_heartbeaters(State).
 
@@ -357,14 +340,13 @@ handle_data1(Bytes, State = #state{proc_state  = ProcState,
             {ok, ensure_stats_timer(State#state{ parse_state = ParseState1 })};
         {ok, Frame, Rest} ->
             case rabbit_stomp_processor:process_frame(Frame, ProcState) of
-                {ok, ProcState1, ConnPid} ->
+                {ok, ProcState1} ->
                     ParseState1 = rabbit_stomp_frame:initial_state(),
                     State1 = maybe_block(State, Frame),
                     handle_data1(
                       Rest,
                       State1 #state{ parse_state = ParseState1,
-                                     proc_state  = ProcState1,
-                                     connection  = ConnPid });
+                                     proc_state  = ProcState1});
                 {stop, _Reason, ProcState1} ->
                     %% do not exit here immediately, because we need to wait for messages eventually enqueued by process_request
                     self() ! close_websocket,
@@ -375,7 +357,7 @@ handle_data1(Bytes, State = #state{proc_state  = ProcState,
     end.
 
 maybe_block(State = #state{state = blocking, heartbeat = Heartbeat},
-            #stomp_frame{command = "SEND"}) ->
+            #stomp_frame{command = 'SEND'}) ->
     rabbit_heartbeat:pause_monitor(Heartbeat),
     State#state{state = blocked};
 maybe_block(State, _) ->
@@ -425,19 +407,58 @@ maybe_emit_stats(State) ->
     rabbit_event:if_enabled(State, #state.stats_timer,
                                 fun() -> emit_stats(State) end).
 
-emit_stats(State=#state{connection = C}) when C == none; C == undefined ->
-    %% Avoid emitting stats on terminate when the connection has not yet been
-    %% established, as this causes orphan entries on the stats database
-    State1 = rabbit_event:reset_stats_timer(State, #state.stats_timer),
-    State1;
-emit_stats(State=#state{socket=Sock, state=RunningState, connection=Conn}) ->
+emit_stats(State=#state{socket=Sock, state=RunningState}) ->
     SockInfos = case rabbit_net:getstat(Sock,
             [recv_oct, recv_cnt, send_oct, send_cnt, send_pend]) of
         {ok,    SI} -> SI;
         {error,  _} -> []
     end,
-    Infos = [{pid, Conn}, {state, RunningState}|SockInfos],
-    rabbit_core_metrics:connection_stats(Conn, Infos),
+    Infos = [{pid, self()}, {state, RunningState}|SockInfos],
+    rabbit_core_metrics:connection_stats(self(), Infos),
     rabbit_event:notify(connection_stats, Infos),
     State1 = rabbit_event:reset_stats_timer(State, #state.stats_timer),
     State1.
+
+infos(Items, State) -> [{Item, info_internal(Item, State)} || Item <- Items].
+
+info_internal(pid, _) -> self();
+info_internal(SockStat, #state{socket = Sock}) when SockStat =:= recv_oct;
+                                                    SockStat =:= recv_cnt;
+                                                    SockStat =:= send_oct;
+                                                    SockStat =:= send_cnt;
+                                                    SockStat =:= send_pend ->
+    case rabbit_net:getstat(Sock, [SockStat]) of
+        {ok, [{_, N}]} when is_number(N) -> N;
+        _ -> 0
+    end;
+info_internal(state, State) -> info_internal(connection_state, State);
+info_internal(garbage_collection, _State) ->
+    rabbit_misc:get_gc_info(self());
+info_internal(reductions, _State) ->
+    {reductions, Reductions} = erlang:process_info(self(), reductions),
+    Reductions;
+info_internal(timeout, _State) ->
+    0;
+info_internal(conn_name, #state{conn_name = Val}) ->
+    rabbit_data_coercion:to_binary(Val);
+info_internal(name, #state{conn_name = Val}) ->
+    rabbit_data_coercion:to_binary(Val);
+info_internal(connection, _) ->
+    self();
+info_internal(connection_state, #state{state = Val}) ->
+    Val;
+info_internal(ssl, #state{socket = Sock}) ->
+    rabbit_net:proxy_ssl_info(Sock, undefined) /= nossl;
+info_internal(SSL, #state{socket = Sock})
+  when SSL =:= ssl_protocol;
+       SSL =:= ssl_key_exchange;
+       SSL =:= ssl_cipher;
+       SSL =:= ssl_hash ->
+    rabbit_ssl:info(SSL, {Sock, undefined});
+info_internal(Key, #state{proc_state = ProcState}) ->
+    rabbit_stomp_processor:info(Key, ProcState).
+
+
+processor_state(#state{proc_state = ProcState }) -> ProcState.
+processor_state(ProcState, #state{} = State) ->
+    State#state{proc_state = ProcState}.
