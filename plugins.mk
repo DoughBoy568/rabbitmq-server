@@ -1,14 +1,9 @@
-# This is the list of Tier-1 plugins shipped with a release.
-#
-# IMPORTANT: This list is overridden in the server-release Concourse
-# pipeline: Concourse takes all tested plugins and put them in the
-# release. So if you want to add or remove a plugin to the distribution,
-# you need to update the server-release pipeline!
+ release. So if you want to add or remove a plugin to the distribution,
 
 PLUGINS := rabbitmq_amqp1_0 \
 	   rabbitmq_auth_backend_cache \
 	   rabbitmq_auth_backend_http \
-	   rabbitmq_auth_backend_internal_loopback \
+	   rabbitmq_auth_backend_internal_loopback 
 	   rabbitmq_auth_backend_ldap \
 	   rabbitmq_auth_backend_oauth2 \
 	   rabbitmq_auth_mechanism_ssl \
@@ -43,4 +38,4 @@ PLUGINS := rabbitmq_amqp1_0 \
 	   rabbitmq_web_mqtt \
 	   rabbitmq_web_mqtt_examples \
 	   rabbitmq_web_stomp \
-	   rabbitmq_web_stomp_examples
+	   rabbitmq_web_stomp_examples/
